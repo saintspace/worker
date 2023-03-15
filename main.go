@@ -2,27 +2,54 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"sync"
+
+	"worker/app"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 )
 
+var eventRouter *app.EventRouter
+
+func init() {
+	// TODO: construct eventRouter with dependency injection
+}
+
 func main() {
 	lambda.Start(handler)
 }
 
-func handler(ctx context.Context, sqsEvent events.SQSEvent) error {
+type LambdaResponse struct {
+	BatchItemFailures []events.SQSBatchItemFailure `json:"batchItemFailures"`
+}
+
+func handler(ctx context.Context, sqsEvent events.SQSEvent) (LambdaResponse, error) {
+	var response LambdaResponse
+	response.BatchItemFailures = []events.SQSBatchItemFailure{}
+
+	var wg sync.WaitGroup
+	failureChan := make(chan events.SQSBatchItemFailure, len(sqsEvent.Records))
+
 	for _, sqsMessage := range sqsEvent.Records {
-		fmt.Printf("SQS message body: %s\n", sqsMessage.Body)
-		task, err := parseTask(sqsMessage.Body)
-		if err != nil {
-			return fmt.Errorf("error while parsing task => %v", err.Error())
-		}
-		err = processTask(task)
-		if err != nil {
-			return fmt.Errorf("error while processing task => %v", err.Error())
-		}
+		wg.Add(1)
+		go func(msg events.SQSMessage) {
+			defer wg.Done()
+			err := eventRouter.ProcessEvent(msg.Body)
+			if err != nil {
+				failureChan <- events.SQSBatchItemFailure{
+					ItemIdentifier: msg.MessageId,
+				}
+			}
+		}(sqsMessage)
 	}
-	return nil
+
+	wg.Wait()
+	close(failureChan)
+
+	for failure := range failureChan {
+		response.BatchItemFailures = append(response.BatchItemFailures, failure)
+	}
+
+	return response, nil
 }
